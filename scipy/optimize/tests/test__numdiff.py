@@ -14,7 +14,8 @@ from scipy._lib._array_api import xp_result_type
 
 from scipy.optimize._numdiff import (
     _adjust_scheme_to_bounds, approx_derivative, check_derivative,
-    group_columns, _eps_for_method, _compute_absolute_step)
+    group_columns, _eps_for_method, _compute_absolute_step,
+    _approx_gradient_batched)
 from scipy.optimize import rosen
 
 
@@ -945,3 +946,70 @@ def test__compute_absolute_step():
     x0 = np.array([1e-3, 0, 1, 10], dtype=np.float16)
     abs_step = _compute_absolute_step(rel_step, x0, f0, '2-point')
     assert abs_step.dtype == np.float16
+
+
+class TestApproxGradientBatched:
+    # `_approx_gradient_batched` must agree exactly with `approx_derivative`
+    # applied to each problem separately.
+
+    @staticmethod
+    def f(x, a):
+        return np.sum(a * x**2) + np.sin(x[0] * x[-1]) + np.exp(x[1])
+
+    def evaluate(self, a):
+        def evaluate(S):
+            k, s, n = S.shape
+            return np.asarray([[self.f(S[i, j], a[i]) for j in range(s)]
+                               for i in range(k)])
+        return evaluate
+
+    @pytest.mark.parametrize('method', ['2-point', '3-point', 'cs'])
+    @pytest.mark.parametrize('steps', [{}, {'rel_step': 1e-4},
+                                       {'abs_step': 1e-6}])
+    @pytest.mark.parametrize('bounded', [False, True])
+    def test_matches_approx_derivative(self, method, steps, bounded):
+        rng = np.random.default_rng(2938475)
+        k, n = 5, 4
+        X = rng.uniform(-1, 1, size=(k, n))
+        a = rng.uniform(1, 2, size=k)
+        if bounded:
+            lb = np.full((k, n), -1.)
+            ub = np.full((k, n), 1.)
+            # points right at or next to the bounds
+            X[0, 0], X[1, 1], X[2, 2] = -1, 1 - 1e-9, 1
+            ub[3, 3] = np.inf
+        else:
+            lb, ub = -np.inf, np.inf
+        f0 = np.asarray([self.f(X[i], a[i]) for i in range(k)])
+        G, nfev = _approx_gradient_batched(self.evaluate(a), X, f0,
+                                           method=method, lb=lb, ub=ub,
+                                           **steps)
+        assert G.shape == (k, n)
+        assert nfev == (2*n if method == '3-point' else n)
+        for i in range(k):
+            bounds = ((lb[i], ub[i]) if bounded and method != 'cs'
+                      else (-np.inf, np.inf))
+            ref = approx_derivative(self.f, X[i], method=method, f0=f0[i],
+                                    args=(a[i],), bounds=bounds, **steps)
+            assert_equal(G[i], ref)
+
+    @pytest.mark.parametrize('method', ['2-point', '3-point'])
+    def test_fixed_variables(self, method):
+        X = np.asarray([[0.5, 0.25], [0.1, 0.2]])
+        a = np.ones(2)
+        lb = np.asarray([[0.5, -1.], [-1., 0.2]])
+        ub = np.asarray([[0.5, 1.], [1., 0.2]])
+        f0 = np.asarray([self.f(x, 1.) for x in X])
+        G, _ = _approx_gradient_batched(self.evaluate(a), X, f0,
+                                        method=method, lb=lb, ub=ub)
+        assert G[0, 0] == 0 and G[1, 1] == 0
+        assert np.all(np.isfinite(G))
+
+    def test_input_validation(self):
+        X = np.zeros((2, 3))
+        with pytest.raises(ValueError, match="Unknown method"):
+            _approx_gradient_batched(None, X, np.zeros(2), method='4-point')
+        with pytest.raises(ValueError, match="must have shape"):
+            _approx_gradient_batched(None, X, np.zeros(3))
+        with pytest.raises(ValueError, match="must return an array"):
+            _approx_gradient_batched(lambda S: np.zeros(2), X, np.zeros(2))
