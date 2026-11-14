@@ -1,4 +1,5 @@
 #include "lbfgsb.h"
+#include <string.h>
 
 
 enum Status {
@@ -391,6 +392,72 @@ setulb(CBLAS_INT n, CBLAS_INT m, double* x, double* l, double* u, CBLAS_INT* nbd
            lsave, &isave[21], dsave, maxls, &ln_task[0], &ln_task[1]);
 
     return;
+}
+
+
+static inline void
+save_iterate(CBLAS_INT n, const double* x, double f, const double* g,
+             double* xk, double* fk, double* gk)
+{
+    memcpy(xk, x, (size_t)n * sizeof(double));
+    memcpy(gk, g, (size_t)n * sizeof(double));
+    *fk = f;
+}
+
+
+void
+setulb_batch(CBLAS_INT n, CBLAS_INT m, ptrdiff_t n_idx, const ptrdiff_t* idx,
+             double* x, double* l, double* u, CBLAS_INT* nbd, double* f, double* g,
+             double factr, double pgtol, double* wa, ptrdiff_t lwa, CBLAS_INT* iwa,
+             CBLAS_INT* task, CBLAS_INT* lsave, CBLAS_INT* isave, double* dsave,
+             CBLAS_INT maxls, CBLAS_INT* ln_task, double* xk, double* fk, double* gk,
+             int64_t* nit, const int64_t* nfev, int64_t maxiter, int64_t maxfun)
+{
+    // Advance every problem in idx until it requests an evaluation (FG) or
+    // terminates. The stopping logic mirrors the reverse-communication loop in
+    // scipy/optimize/_lbfgsb_py.py::_minimize_lbfgsb, so that each problem
+    // follows exactly the same sequence of iterates as a single-problem run.
+    for (ptrdiff_t k = 0; k < n_idx; k++)
+    {
+        const ptrdiff_t i = idx[k];
+        double* xi = x + i*(ptrdiff_t)n;
+        double* gi = g + i*(ptrdiff_t)n;
+        double* xki = xk + i*(ptrdiff_t)n;
+        double* gki = gk + i*(ptrdiff_t)n;
+        CBLAS_INT* ti = task + 2*i;
+
+        // f and g at the (projected) starting point have just been supplied;
+        // this is the first accepted iterate.
+        if ((ti[0] == FG) && (ti[1] == FG_START))
+        {
+            save_iterate(n, xi, f[i], gi, xki, &fk[i], gki);
+        }
+
+        while (1)
+        {
+            setulb(n, m, xi, l + i*(ptrdiff_t)n, u + i*(ptrdiff_t)n,
+                   nbd + i*(ptrdiff_t)n, &f[i], gi, factr, pgtol, wa + i*lwa,
+                   iwa + i*3*(ptrdiff_t)n, ti, lsave + 4*i, isave + 44*i,
+                   dsave + 29*i, maxls, ln_task + 2*i);
+
+            // FG: the driver must evaluate f and g; anything else but NEW_X
+            // is a terminal state (CONVERGENCE, STOP, ABNORMAL, ERROR).
+            if (ti[0] != NEW_X) { break; }
+
+            nit[i] += 1;
+            save_iterate(n, xi, f[i], gi, xki, &fk[i], gki);
+            if (nit[i] >= maxiter)
+            {
+                ti[0] = STOP;
+                ti[1] = STOP_ITERC;
+            } else if (nfev[i] > maxfun) {
+                ti[0] = STOP;
+                ti[1] = STOP_ITER;
+            }
+            // Loop around: on STOP the next setulb call only saves its state
+            // and returns, on NEW_X it continues with the next iteration.
+        }
+    }
 }
 
 
