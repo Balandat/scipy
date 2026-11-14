@@ -245,6 +245,8 @@ def minimize(fun, x0, args=(), method=None, jac=None, hess=None,
     --------
     minimize_scalar : Interface to minimization algorithms for scalar
         univariate functions
+    minimize_batched : Minimization of many independent multivariate
+        functions simultaneously
     show_options : Additional options accepted by the solvers
 
     Notes

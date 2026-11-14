@@ -2143,3 +2143,92 @@ There are several important points to note about this example:
   variables. For ``slow_func`` vectorization occurs on ``(N, S)`` shaped arrays.
 * This approach is not needed for :func:`differential_evolution` as that minimizer
   already has a keyword for vectorization.
+
+.. _tutorial-optimize_batched:
+
+Batched minimization of many problems
+-------------------------------------
+
+The ``workers`` approach above parallelizes the function evaluations *within*
+one minimization, e.g. for numerical differentiation; it does not help when
+the gradient is computed analytically. Another common situation is that many
+*independent* minimizations have to be carried out: a multi-start strategy
+runs a local minimizer from many starting points, and parametric studies solve
+the same problem for many parameter values. If the objective function is
+vectorized (e.g. written with NumPy array operations, or with an array library
+such as PyTorch or CuPy that may run on a GPU), evaluating it at many points is
+often not much more expensive than evaluating it at a single point.
+
+:func:`minimize_batched` exploits this. It runs one instance of the L-BFGS-B
+algorithm per problem; in every round, the objective function of all problems
+that need an evaluation is evaluated with a *single* call, and problems drop out
+of the batch as they converge. The iterations of each problem are exactly those
+of ``minimize(..., method='L-BFGS-B')``.
+
+The objective function follows the same convention as :func:`rosen` and
+:func:`differential_evolution` with ``vectorized=True``: the first axis of its
+argument corresponds with the variables, and the remaining axes index the
+problems.
+
+::
+
+    >>> from scipy.optimize import minimize_batched, rosen, rosen_der, Bounds
+    >>> rng = np.random.default_rng(4528390235)
+    >>> x0 = rng.uniform(-2, 2, size=(4, 20))   # 20 starting points in 4-D
+    >>> res = minimize_batched(rosen, x0, jac=rosen_der)
+    >>> res.x.shape, res.fun.shape
+    ((4, 20), (20,))
+    >>> best = res.x[:, np.argmin(res.fun)]
+    >>> np.allclose(best, 1, atol=1e-4)
+    True
+
+Parameters that differ between the problems are passed via ``args``. The
+arrays in ``args`` are broadcast against the batch shape and, like ``x``,
+contain only the entries of the problems that are still being iterated. For
+example, here we find the minimum of :math:`(x_0 - a)^2 + (x_1 - a^2)^2 +
+\sin(3 x_0)` for 100 values of :math:`a` at once; we also pass the index of
+each problem, which is useful when the objective needs to look up
+problem-specific data::
+
+    >>> def f(x, a, i):
+    ...     return (x[0] - a)**2 + (x[1] - a**2)**2 + np.sin(3*x[0])
+    >>> a = np.linspace(-1, 1, 100)
+    >>> res = minimize_batched(f, np.zeros(2), args=(a, np.arange(100)),
+    ...                        jac='3-point')
+    >>> res.x.shape
+    (2, 100)
+    >>> bool(np.all(res.success))
+    True
+
+When finite differences are used for the gradients (as above), the finite
+difference points of all problems are also evaluated with a single call. In
+that case, the argument of the objective function has shape ``(n, k, s)``:
+``s`` points for each of the ``k`` problems still in progress, and the arrays
+in ``args`` have shape ``(k, 1)``.
+
+The objective function is called with arrays of the array library of ``x0``
+(e.g. PyTorch, CuPy or JAX arrays, on the same device). Since problems drop out
+of the batch as they converge, the number of problems passed to the objective
+changes during the optimization. With JAX, a function compiled with
+``jax.jit`` is recompiled for every new shape. The number of compilations can
+be limited by padding the batch to a few sizes, here powers of two:
+
+.. code-block:: python
+
+    import jax
+    import jax.numpy as jnp
+    jax.config.update("jax_enable_x64", True)
+
+    @jax.jit
+    def f_and_grad(x):  # x: (n, k)
+        f = lambda x: jnp.sum(x**4 - 16*x**2 + 5*x, axis=0)
+        return f(x), jax.grad(lambda x: jnp.sum(f(x)))(x)
+
+    def fun(x):
+        k = x.shape[1]
+        size = 1 << (k - 1).bit_length()  # next power of two
+        f, g = f_and_grad(jnp.pad(x, ((0, 0), (0, size - k))))
+        return f[:k], g[:, :k]
+
+    x0 = jax.random.uniform(jax.random.key(0), (10, 1000), minval=-5, maxval=5)
+    res = minimize_batched(fun, x0, jac=True, bounds=Bounds(-5, 5))
