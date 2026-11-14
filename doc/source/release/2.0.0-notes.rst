@@ -47,6 +47,9 @@ New features
 
 ``scipy.optimize`` improvements
 ===============================
+- ``minimize(method='L-BFGS-B')`` now reports the objective function value at
+  the returned point ``x`` when the line search terminates abnormally;
+  previously, ``fun`` could be the value at the last (rejected) trial point.
 
 
 ``scipy.signal`` improvements

@@ -123,3 +123,21 @@ def test_gh_issue18730():
     res = minimize(fun_single_precision, x0=np.array([1., 1.]), jac=True,
                    method="l-bfgs-b")
     np.testing.assert_allclose(res.fun, 0., atol=1e-15)
+
+def test_abnormal_termination_fun_consistent_with_x():
+    # On abnormal termination of the line search, setulb restores x and g to
+    # the last accepted iterate. `res.fun` must correspond to `res.x`, too
+    # (it used to be the function value at the last trial point).
+    def fun(x):
+        # gradient with the wrong sign makes every line search fail
+        return x @ x, -2*x
+
+    for maxls in [1, 3]:
+        res = minimize(fun, x0=np.array([1., 2.]), jac=True,
+                       method="l-bfgs-b", options=dict(maxls=maxls))
+        assert res.message.startswith("ABNORMAL")
+        assert not res.success
+        f, g = fun(res.x)
+        assert res.fun == f
+        np.testing.assert_array_equal(res.jac, g)
+
