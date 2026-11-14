@@ -52,6 +52,7 @@ Local (multivariate) optimization
    :toctree: generated/
 
    minimize - Interface for minimizers of multivariate functions.
+   minimize_batched - Minimize many independent multivariate functions simultaneously.
 
 The `minimize` function supports the following methods:
 
@@ -422,6 +423,7 @@ Simple iteration solvers:
 
 from ._optimize import *
 from ._minimize import *
+from ._minimize_batched import minimize_batched
 from ._root import *
 from ._root_scalar import *
 from ._minpack_py import *
