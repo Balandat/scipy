@@ -33,6 +33,7 @@ py3.install_sources([
     'test_lsq_common.py',
     'test_lsq_linear.py',
     'test_milp.py',
+    'test_minimize_batched.py',
     'test_minimize_constrained.py',
     'test_minpack.py',
     'test_nnls.py',

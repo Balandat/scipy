@@ -16,7 +16,7 @@ with safe_import():
     import scipy.optimize
     from scipy.optimize import (rosen, rosen_der, rosen_hess, leastsq, basinhopping,
                                 differential_evolution, dual_annealing, shgo, direct,
-                                biteopt)
+                                biteopt, minimize, Bounds)
     from scipy.optimize._minimize import MINIMIZE_METHODS
     from .cutest.calfun import calfun
     from .cutest.dfoxs import dfoxs
@@ -657,3 +657,55 @@ class BenchDFO(Benchmark):
         b = _BenchOptimizers(f"DFO benchmark problem {prob_number}", fun=func)
         b.bench_run(x0, methods=methods)
         return b
+
+
+class BenchMinimizeBatched(Benchmark):
+    """Many independent problems: `minimize_batched` vs. a loop of `minimize`.
+
+    The objective is vectorized (`rosen`/`rosen_der` act along axis 0), so
+    `minimize_batched` evaluates all active problems with one call per round,
+    while the loop evaluates one problem at a time.
+    """
+    params = [
+        [1, 10, 100, 1000],
+        [2, 20],
+        ['analytic', '2-point'],
+        ['minimize_batched', 'loop'],
+    ]
+    param_names = ['n_problems', 'n_vars', 'jac', 'strategy']
+
+    def setup(self, n_problems, n_vars, jac, strategy):
+        if not hasattr(scipy.optimize, 'minimize_batched'):
+            raise NotImplementedError("minimize_batched not available")
+        if strategy == 'loop' and n_problems * n_vars > 2000:
+            raise NotImplementedError("too slow")
+        rng = np.random.default_rng(4823749)
+        self.x0 = rng.uniform(-2, 2, size=(n_vars, n_problems))
+        self.jac = rosen_der if jac == 'analytic' else '2-point'
+        self.bounds = Bounds(-2, 2)
+
+    def time_minimize(self, n_problems, n_vars, jac, strategy):
+        if strategy == 'minimize_batched':
+            scipy.optimize.minimize_batched(rosen, self.x0, jac=self.jac,
+                                            bounds=self.bounds)
+        else:
+            for x0 in self.x0.T:
+                minimize(rosen, x0, jac=self.jac, method='L-BFGS-B',
+                         bounds=self.bounds)
+
+    def track_nfev(self, n_problems, n_vars, jac, strategy):
+        # number of calls of the objective function (not of evaluated points)
+        calls = [0]
+
+        def fun(x):
+            calls[0] += 1
+            return rosen(x)
+
+        if strategy == 'minimize_batched':
+            scipy.optimize.minimize_batched(fun, self.x0, jac=self.jac,
+                                            bounds=self.bounds)
+        else:
+            for x0 in self.x0.T:
+                minimize(fun, x0, jac=self.jac, method='L-BFGS-B',
+                         bounds=self.bounds)
+        return calls[0]

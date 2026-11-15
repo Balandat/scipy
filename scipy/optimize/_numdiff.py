@@ -767,6 +767,121 @@ def _dense_difference(fun, x0, f0, h, use_one_sided, method, workers):
     return J_transposed.T, nfev
 
 
+def _approx_gradient_batched(evaluate, x0, f0, *, method='2-point',
+                             rel_step=None, abs_step=None,
+                             lb=-np.inf, ub=np.inf):
+    """Finite difference gradients of many independent scalar functions.
+
+    Batched counterpart of `approx_derivative` for dense gradients of
+    scalar-valued functions. The finite difference points of all ``k``
+    problems are evaluated with a *single* call to `evaluate`. Step sizes,
+    adjustment of the difference scheme to the bounds and the difference
+    formulas are the same as in `approx_derivative` (operation by operation),
+    so that row ``i`` of the result equals
+    ``approx_derivative(f_i, x0[i], f0=f0[i], ...)``.
+
+    Parameters
+    ----------
+    evaluate : callable
+        ``evaluate(S) -> F`` where ``S`` has shape ``(k, s, n)`` and contains
+        ``s`` points for each of the ``k`` problems; ``F`` must have shape
+        ``(k, s)`` and contain the function values of problem ``i`` at the
+        points ``S[i]``.
+    x0 : ndarray, shape (k, n)
+        Points at which to estimate the gradients.
+    f0 : ndarray, shape (k,)
+        Function values at `x0`.
+    method : {'2-point', '3-point', 'cs'}, optional
+        Finite difference method.
+    rel_step, abs_step : None or array_like, optional
+        Relative or absolute step size; see `approx_derivative`. Must be
+        broadcastable to ``(k, n)``.
+    lb, ub : array_like, optional
+        Lower and upper bounds, broadcastable to ``(k, n)``. Points are kept
+        within the bounds as in `approx_derivative`. Gradient entries of
+        variables with ``lb == ub`` are set to zero for the '2-point' and
+        '3-point' methods.
+
+    Returns
+    -------
+    grad : ndarray, shape (k, n)
+        Estimated gradients.
+    nfev : int
+        Number of function evaluations used per problem (``s``).
+    """
+    x0 = np.asarray(x0)
+    f0 = np.asarray(f0)
+    if x0.ndim != 2 or f0.shape != x0.shape[:1]:
+        raise ValueError("`x0` must have shape (k, n) and `f0` shape (k,).")
+    k, n = x0.shape
+    lb = np.broadcast_to(np.asarray(lb, dtype=float), x0.shape)
+    ub = np.broadcast_to(np.asarray(ub, dtype=float), x0.shape)
+
+    if method not in ('2-point', '3-point', 'cs'):
+        raise ValueError(f"Unknown method '{method}'.")
+
+    if abs_step is None:
+        h = _compute_absolute_step(rel_step, x0, f0, method)
+    else:
+        # same as in `approx_derivative`: a zero effective step falls back to
+        # the default relative step.
+        sign_x0 = (x0 >= 0).astype(x0.dtype) * 2 - 1
+        h = np.asarray(abs_step)
+        dx = ((x0 + h) - x0)
+        h = np.where(dx == 0,
+                     _eps_for_method(x0.dtype, f0.dtype, method) *
+                     sign_x0 * np.maximum(1.0, np.abs(x0)),
+                     h)
+        h = h.astype(x0.dtype)
+    h = np.broadcast_to(h, x0.shape)
+
+    def _evaluate(S):
+        F = np.asarray(evaluate(S))
+        if F.shape != S.shape[:2]:
+            raise ValueError("The objective function must return an array of "
+                             f"shape {S.shape[:2]}, got shape {F.shape}.")
+        return F
+
+    ar = np.arange(n)
+    fixed = lb == ub
+    if method == '2-point':
+        h, _ = _adjust_scheme_to_bounds(x0, h, 1, '1-sided', lb, ub)
+        x1 = x0 + h
+        S = np.repeat(x0[:, np.newaxis, :], n, axis=1)
+        S[:, ar, ar] = x1
+        F = _evaluate(S)
+        dx = x1 - x0
+        df = F - f0[:, np.newaxis]
+        with np.errstate(divide='ignore', invalid='ignore'):
+            grad = df / dx
+        grad[fixed] = 0
+        nfev = n
+    elif method == '3-point':
+        h, use_one_sided = _adjust_scheme_to_bounds(x0, h, 1, '2-sided', lb, ub)
+        x1 = np.where(use_one_sided, x0 + h, x0 - h)
+        x2 = np.where(use_one_sided, x0 + 2*h, x0 + h)
+        S = np.repeat(x0[:, np.newaxis, :], 2*n, axis=1)
+        S[:, ar, ar] = x1
+        S[:, n + ar, ar] = x2
+        F = _evaluate(S)
+        f1, f2 = F[:, :n], F[:, n:]
+        dx = np.where(use_one_sided, x2 - x0, x2 - x1)
+        df = np.where(use_one_sided, -3.0 * f0[:, np.newaxis] + 4 * f1 - f2,
+                      f2 - f1)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            grad = df / dx
+        grad[fixed] = 0
+        nfev = 2*n
+    else:  # 'cs'
+        S = np.repeat(x0.astype(complex)[:, np.newaxis, :], n, axis=1)
+        S[:, ar, ar] += h * 1.j
+        F = _evaluate(S)
+        grad = F.imag / h
+        nfev = n
+
+    return grad, nfev
+
+
 def _sparse_difference(fun, x0, f0, h, use_one_sided,
                        structure, groups, method, workers):
     m = f0.size

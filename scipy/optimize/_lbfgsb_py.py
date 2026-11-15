@@ -435,6 +435,13 @@ def _minimize_lbfgsb(fun, x0, args=(), jac=None, bounds=None, maxcor=10,
         else:
             break
 
+    if task[0] == 8:
+        # ABNORMAL termination of the line search: setulb restores x and g to
+        # the last accepted iterate, and f to its value there (``fold``).
+        # ``f`` is passed to setulb by value, so pick up the restored value
+        # from the state array (dsave[1] holds ``fold``).
+        f = dsave[1]
+
     if task[0] == 4:
         warnflag = 0
     elif sf.nfev > maxfun or n_iterations >= maxiter:
