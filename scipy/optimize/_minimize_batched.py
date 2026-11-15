@@ -3,6 +3,7 @@ Batched minimization of many independent multivariate functions.
 """
 import math
 import operator
+import os
 
 import numpy as np
 
@@ -10,6 +11,7 @@ from scipy._lib._array_api import (
     array_namespace, xp_capabilities, xp_result_device, xp_result_type,
     is_numpy, is_cupy, is_torch, is_array_api_strict)
 from scipy._lib._elementwise_iterative_method import _EINPROGRESS, _ECONVERGED
+from scipy._lib._util import MapWrapper
 from ._optimize import OptimizeResult
 from ._constraints import Bounds
 from ._numdiff import _approx_gradient_batched
@@ -144,6 +146,37 @@ def _prepare_bounds(bounds, n, batch_shape):
     return lb, ub
 
 
+def _n_workers(workers):
+    """Number of chunks to create for `workers` (None: no parallelism)."""
+    if workers is None:
+        return 1
+    if callable(workers):
+        n_cpus = getattr(os, "process_cpu_count", os.cpu_count)()
+        return n_cpus or 1
+    try:
+        k = operator.index(workers)
+    except TypeError as e:
+        raise ValueError("`workers` must be None, an integer, or a map-like "
+                         "callable.") from e
+    if k == -1:
+        return getattr(os, "process_cpu_count", os.cpu_count)() or 1
+    if k < 1:
+        raise ValueError("`workers` must be -1, a positive integer, or a "
+                         "map-like callable.")
+    return k
+
+
+_CHUNK_RESULT_KEYS = ('x', 'fun', 'jac', 'nit', 'nfev', 'njev', 'status', 'message')
+
+
+def _minimize_batched_chunk(task):
+    """Solve one chunk of problems (run by the workers; must be pickleable)."""
+    fun, x0, kwds = task
+    res = minimize_batched(fun, x0, **kwds)
+    # results are returned as NumPy arrays (also for other array namespaces)
+    return {key: _to_numpy(res[key]) for key in _CHUNK_RESULT_KEYS}
+
+
 @xp_capabilities(
     cpu_only=True, exceptions=["cupy", "torch", "jax.numpy"], jax_jit=False,
     skip_backends=[("dask.array", "the iterations run eagerly on the host")],
@@ -153,7 +186,7 @@ def _prepare_bounds(bounds, n, batch_shape):
         "`x0`; their outputs are copied to the host in every iteration."))
 def minimize_batched(fun, x0, /, *, method='L-BFGS-B', jac=None, bounds=None,
                      args=(), kwargs=None, tolerances=None, maxiter=15000,
-                     callback=None, options=None):
+                     callback=None, options=None, workers=None):
     r"""Minimize many independent multivariate functions simultaneously.
 
     Solves a batch of independent problems
@@ -271,6 +304,27 @@ def minimize_batched(fun, x0, /, *, method='L-BFGS-B', jac=None, bounds=None,
           for ``jac`` in ``{'2-point', '3-point', 'cs'}``. If None,
           an appropriate step size is chosen automatically.
 
+    workers : int or map-like callable, optional
+        Solve the problems in parallel. The batch is split into chunks, one
+        per worker (with at least two problems per chunk), and each chunk is
+        solved with a separate call of `minimize_batched`; the results are
+        assembled into the result of the whole batch.
+
+        - ``None`` or ``1`` (default): no parallelism; the whole batch is
+          solved in the current process.
+        - An integer ``k > 1``: a `multiprocessing.Pool <multiprocessing.pool.Pool>`
+          with ``k`` processes is created for the call; ``-1`` uses all
+          available CPUs. `fun`, `jac`, and the arrays in `args` and `kwargs`
+          must be pickleable.
+        - A map-like callable such as ``multiprocessing.Pool.map`` or
+          ``concurrent.futures.ThreadPoolExecutor.map``: chunks are evaluated
+          as ``workers(func, iterable)``; the batch is split into as many
+          chunks as there are CPUs. Reusing a pool across calls avoids the
+          cost of starting processes, and a thread pool does not require
+          pickleable functions.
+
+        `callback` cannot be combined with `workers`. See Notes.
+
     Returns
     -------
     res : OptimizeResult
@@ -361,6 +415,21 @@ def minimize_batched(fun, x0, /, *, method='L-BFGS-B', jac=None, bounds=None,
     with an argument of shape ``(n, k, s)``, where ``s`` is ``n`` for
     ``'2-point'`` and ``'cs'`` and ``2n`` for ``'3-point'``.
 
+    On the CPU, a single call of `minimize_batched` uses one core (unless the
+    objective function itself is multithreaded). With `workers`, the problems
+    are distributed over several cores, and each worker still evaluates its
+    problems in batches; for large batches, this combines the benefits of
+    batching and of parallelism. Parallel evaluation is not beneficial for
+    objective functions that are evaluated on a GPU, nor for small batches of
+    cheap problems, where the cost of distributing the work dominates. Each
+    worker process evaluates `fun` with its own BLAS library; to avoid
+    oversubscription, limit the number of BLAS threads per process (e.g. with
+    ``threadpoolctl``) when `fun` uses multithreaded linear algebra. With
+    process-based `workers`, `fun` (including any data it refers to) is
+    pickled and sent to every worker. Results are identical to those without
+    `workers` if `fun` returns the same values for a problem regardless of
+    which other problems are evaluated in the same call.
+
     References
     ----------
     .. [1] R. H. Byrd, P. Lu and J. Nocedal. A Limited Memory Algorithm for
@@ -429,6 +498,9 @@ def minimize_batched(fun, x0, /, *, method='L-BFGS-B', jac=None, bounds=None,
         raise ValueError("`fun` must be callable.")
     if callback is not None and not callable(callback):
         raise ValueError("`callback` must be callable.")
+    n_workers = _n_workers(workers)
+    if n_workers > 1 and callback is not None:
+        raise ValueError("`callback` cannot be used together with `workers`.")
     meth = str(method).lower()
     if meth not in _DEFAULT_OPTIONS:
         raise ValueError(f"Unknown method '{method}'; supported methods are "
@@ -591,6 +663,27 @@ def minimize_batched(fun, x0, /, *, method='L-BFGS-B', jac=None, bounds=None,
             except StopIteration:
                 return True
             return False
+
+    # --- parallel evaluation of chunks of problems ------------------------------
+    n_chunks = min(n_workers, B // 2)  # at least two problems per chunk
+    if n_chunks > 1:
+        chunks = np.array_split(np.arange(B), n_chunks)
+        tasks = []
+        for idx in chunks:
+            idx_xp = xp.asarray(idx, device=device)
+            ps = [xp.take(p, idx_xp, axis=0) for p in params]
+            kwds = dict(method=method, jac=jac, args=tuple(ps[:len(args)]),
+                        kwargs=dict(zip(kw_keys, ps[len(args):])),
+                        tolerances=tol, maxiter=maxiter, options=options)
+            if bounds is not None:
+                kwds['bounds'] = Bounds(lb[idx].T, ub[idx].T)
+            tasks.append((fun, to_xp(x0_np[idx].T), kwds))
+        with MapWrapper(workers) as mapper:
+            parts = list(mapper(_minimize_batched_chunk, tasks))
+        d = {key: np.concatenate([part[key] for part in parts], axis=-1)
+             for key in _CHUNK_RESULT_KEYS}
+        d['x'], d['jac'] = d['x'].T, d['jac'].T  # internal layout: (B, n)
+        return prepare_result(d, final=True)
 
     if B == 0:
         empty = dict(x=np.empty((0, n)), fun=np.empty(0), jac=np.empty((0, n)),

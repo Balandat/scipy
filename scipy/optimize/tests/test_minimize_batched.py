@@ -1,3 +1,5 @@
+import functools
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -29,26 +31,29 @@ def fg_scalar(x, a=0.):
     return f_scalar(x, a), g_scalar(x, a)
 
 
+def _loop_vectorized(f, out, x, *args):
+    x = np.asarray(x)
+    args = [np.broadcast_to(a, x.shape[1:]) for a in args]
+    batch = x.shape[1:]
+    res = [f(x[(slice(None),) + j], *(a[j] for a in args))
+           for j in np.ndindex(batch)]
+    if out == 'f':
+        return np.reshape(np.asarray(res), batch)
+    if out == 'g':
+        return np.reshape(np.stack(res, axis=-1), x.shape)
+    fs = np.reshape(np.asarray([r[0] for r in res]), batch)
+    gs = np.reshape(np.stack([r[1] for r in res], axis=-1), x.shape)
+    return fs, gs
+
+
 def loop_vectorize(f, out='f'):
     """Vectorize a function of a single problem by looping over problems.
 
     Function values are bitwise identical to those of the scalar function, so
-    results can be compared exactly to those of `minimize`.
+    results can be compared exactly to those of `minimize`. The result is
+    pickleable if `f` is (for tests with process-based `workers`).
     """
-    def wrapped(x, *args):
-        x = np.asarray(x)
-        args = [np.broadcast_to(a, x.shape[1:]) for a in args]
-        batch = x.shape[1:]
-        res = [f(x[(slice(None),) + j], *(a[j] for a in args))
-               for j in np.ndindex(batch)]
-        if out == 'f':
-            return np.reshape(np.asarray(res), batch)
-        if out == 'g':
-            return np.reshape(np.stack(res, axis=-1), x.shape)
-        fs = np.reshape(np.asarray([r[0] for r in res]), batch)
-        gs = np.reshape(np.stack([r[1] for r in res], axis=-1), x.shape)
-        return fs, gs
-    return wrapped
+    return functools.partial(_loop_vectorized, f, out)
 
 
 f_vec = loop_vectorize(f_scalar)
@@ -490,6 +495,83 @@ class TestMinimizeBatched:
             assert_equal(res.nfev, ref.nfev)
 
 
+def _thread_map(func, iterable):
+    # a map-like callable based on threads (no pickling required)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        return list(ex.map(func, iterable))
+
+
+class TestWorkers:
+
+    def assert_same(self, res, ref):
+        for key in ['x', 'fun', 'jac', 'nit', 'nfev', 'njev', 'status',
+                    'success', 'message']:
+            assert_equal(res[key], ref[key])
+            assert res[key].dtype == ref[key].dtype
+            assert res[key].shape == ref[key].shape
+
+    @pytest.mark.parametrize('workers', [2, _thread_map])
+    @pytest.mark.parametrize('batch', [(7,), (2, 5)])
+    def test_equal_to_serial(self, workers, batch):
+        # chunks are solved independently; results equal the serial ones
+        rng = np.random.default_rng(29384756)
+        x0 = rng.uniform(-1, 1, size=(3,) + batch)
+        a = rng.uniform(-1, 1, size=batch)
+        lb = rng.uniform(-1, -0.2, size=(3,) + batch)
+        bounds = Bounds(lb, 0.8)
+        kwds = dict(jac=g_vec, args=(a,), bounds=bounds, maxiter=50)
+        ref = minimize_batched(f_vec, x0, **kwds)
+        res = minimize_batched(f_vec, x0, workers=workers, **kwds)
+        self.assert_same(res, ref)
+
+    def test_finite_differences(self):
+        rng = np.random.default_rng(2938475)
+        x0 = rng.uniform(-2, 2, size=(3, 9))
+        a = np.linspace(-1, 1, 9)
+        ref = minimize_batched(f_vec, x0, jac='3-point', args=(a,))
+        res = minimize_batched(f_vec, x0, jac='3-point', args=(a,),
+                               workers=_thread_map)
+        self.assert_same(res, ref)
+
+    def test_chunking(self):
+        # one chunk per CPU (at least two problems per chunk), sizes add up
+        sizes = []
+
+        def recording_map(func, iterable):
+            tasks = list(iterable)
+            sizes.extend(task[1].shape[1] for task in tasks)
+            return _thread_map(func, tasks)
+
+        B = 101
+        x0 = np.random.default_rng(23984).uniform(-2, 2, size=(2, B))
+        res = minimize_batched(rosen, x0, jac=rosen_der, workers=recording_map)
+        n_cpus = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+        assert len(sizes) == min(n_cpus, B // 2) or n_cpus == 1
+        assert sum(sizes) in (B, 0)
+        assert min(sizes, default=2) >= 2
+        assert np.all(res.success)
+
+    def test_small_batch_is_not_distributed(self):
+        def failing_map(func, iterable):
+            raise AssertionError("must not be called")
+
+        x0 = np.zeros((2, 3))
+        res = minimize_batched(rosen, x0, jac=rosen_der, workers=failing_map)
+        assert_allclose(res.x, 1, atol=1e-4)
+
+    def test_input_validation(self):
+        x0 = np.zeros((2, 8))
+        for workers in [0, -2, 1.5, 'all']:
+            with pytest.raises(ValueError, match="`workers` must be"):
+                minimize_batched(rosen, x0, jac=rosen_der, workers=workers)
+        with pytest.raises(ValueError, match="cannot be used together"):
+            minimize_batched(rosen, x0, jac=rosen_der, workers=2,
+                             callback=lambda res: None)
+        # no parallelism: `workers=1` and `None` are allowed with a callback
+        minimize_batched(rosen, x0, jac=rosen_der, workers=1,
+                         callback=lambda res: None)
+
+
 def f_xp(x, a):
     # Array API compatible test function with minimum at x = 1 (any `a`)
     xp = array_namespace(x, a)
@@ -542,6 +624,19 @@ class TestMinimizeBatchedArrayAPI:
         xp_assert_equal(res.status, xp.zeros((2, 2), dtype=xp.int32))
         assert res.nit.dtype == xp.int32
         assert res.message.shape == (2, 2)
+
+    def test_workers(self, xp):
+        # parallel chunks with a thread map return results in the namespace
+        # and on the device of x0, equal to the serial results
+        x0 = xp.asarray(np.random.default_rng(4).uniform(-1.5, 1.5, (3, 8)))
+        a = xp.zeros(8, dtype=x0.dtype)
+        ref = minimize_batched(f_xp, x0, jac=g_xp, args=(a,))
+        res = minimize_batched(f_xp, x0, jac=g_xp, args=(a,),
+                               workers=_thread_map)
+        assert array_namespace(res.x) is array_namespace(x0)
+        assert xp_device(res.x) == xp_device(x0)
+        xp_assert_equal(res.x, ref.x)
+        xp_assert_equal(res.nit, ref.nit)
 
     def test_torch_autograd(self, xp):
         # Outputs that are part of an autograd graph are supported

@@ -2206,6 +2206,23 @@ that case, the argument of the objective function has shape ``(n, k, s)``:
 ``s`` points for each of the ``k`` problems still in progress, and the arrays
 in ``args`` have shape ``(k, 1)``.
 
+On the CPU, one call of :func:`minimize_batched` uses a single core. For large
+batches, the ``workers`` keyword distributes the problems over several cores: the
+batch is split into one chunk per worker, and each worker solves its chunk with
+batched evaluations. As for other SciPy functions with a ``workers`` keyword, an
+integer creates a :class:`multiprocessing.Pool <multiprocessing.pool.Pool>` (``-1``
+for all CPUs; the objective function must be pickleable), and any map-like
+callable can be used instead, for instance the ``map`` method of a pool that is
+reused across calls, or of a :class:`concurrent.futures.ThreadPoolExecutor`::
+
+    >>> res = minimize_batched(rosen, rng.uniform(-2, 2, size=(4, 200)),
+    ...                        jac=rosen_der, workers=2)
+    >>> res.x.shape
+    (4, 200)
+
+Parallel evaluation does not help for objective functions evaluated on a GPU or
+for small batches of cheap problems.
+
 The objective function is called with arrays of the array library of ``x0``
 (e.g. PyTorch, CuPy or JAX arrays, on the same device). Since problems drop out
 of the batch as they converge, the number of problems passed to the objective

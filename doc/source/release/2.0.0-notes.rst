@@ -54,8 +54,9 @@ New features
   vectorized (or GPU-backed) objective function, and problems drop out of the
   batch as they converge. This is useful for multi-start optimization and for
   solving many related problems at once. It supports bounds, analytical and
-  batched finite difference gradients, and objective functions written with
-  any array API compatible library.
+  batched finite difference gradients, objective functions written with any
+  array API compatible library, and parallel evaluation of chunks of the batch
+  with the ``workers`` keyword.
 - ``minimize(method='L-BFGS-B')`` now reports the objective function value at
   the returned point ``x`` when the line search terminates abnormally;
   previously, ``fun`` could be the value at the last (rejected) trial point.
