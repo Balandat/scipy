@@ -151,6 +151,13 @@ def _n_workers(workers):
     if workers is None:
         return 1
     if callable(workers):
+        # `Pool.map` and `concurrent.futures` executors' `map`: one chunk per
+        # worker of the pool; other map-like callables: one chunk per CPU
+        pool = getattr(workers, "__self__", None)
+        for attr in ("_processes", "_max_workers"):
+            k = getattr(pool, attr, None)
+            if isinstance(k, int) and k >= 1:
+                return k
         n_cpus = getattr(os, "process_cpu_count", os.cpu_count)()
         return n_cpus or 1
     try:
@@ -318,10 +325,13 @@ def minimize_batched(fun, x0, /, *, method='L-BFGS-B', jac=None, bounds=None,
           must be pickleable.
         - A map-like callable such as ``multiprocessing.Pool.map`` or
           ``concurrent.futures.ThreadPoolExecutor.map``: chunks are evaluated
-          as ``workers(func, iterable)``; the batch is split into as many
-          chunks as there are CPUs. Reusing a pool across calls avoids the
-          cost of starting processes, and a thread pool does not require
-          pickleable functions.
+          as ``workers(func, iterable)``. For the ``map`` method of a
+          `multiprocessing.pool.Pool` or of a `concurrent.futures` executor,
+          the batch is split into one chunk per worker of the pool; for other
+          map-like callables, into one chunk per CPU. Reusing a pool across
+          calls avoids the cost of starting processes, and a thread pool does
+          not require pickleable functions (and avoids sending the data that
+          `fun` refers to to other processes).
 
         `callback` cannot be combined with `workers`. See Notes.
 
@@ -426,7 +436,9 @@ def minimize_batched(fun, x0, /, *, method='L-BFGS-B', jac=None, bounds=None,
     oversubscription, limit the number of BLAS threads per process (e.g. with
     ``threadpoolctl``) when `fun` uses multithreaded linear algebra. With
     process-based `workers`, `fun` (including any data it refers to) is
-    pickled and sent to every worker. Results are identical to those without
+    pickled and sent with every chunk; if `fun` refers to large data, a
+    thread pool (e.g. ``workers=ThreadPoolExecutor(4).map``) is usually
+    faster than processes. Results are identical to those without
     `workers` if `fun` returns the same values for a problem regardless of
     which other problems are evaluated in the same call.
 

@@ -551,6 +551,28 @@ class TestWorkers:
         assert min(sizes, default=2) >= 2
         assert np.all(res.success)
 
+    def test_chunks_per_pool_worker(self):
+        # for executors, the number of chunks equals the number of workers
+        sizes = []
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            def map_(func, iterable):
+                tasks = list(iterable)
+                sizes.extend(task[1].shape[1] for task in tasks)
+                return ex.map(func, tasks)
+            # a plain function: one chunk per CPU
+            x0 = np.random.default_rng(3).uniform(-2, 2, size=(2, 60))
+            minimize_batched(rosen, x0, jac=rosen_der, workers=map_)
+            n_cpus = getattr(os, "process_cpu_count", os.cpu_count)() or 1
+            assert len(sizes) == min(n_cpus, 30) or n_cpus == 1
+            # the executor's bound `map`: one chunk per worker
+            sizes.clear()
+            ref = minimize_batched(rosen, x0, jac=rosen_der)
+            res = minimize_batched(rosen, x0, jac=rosen_der, workers=ex.map)
+            self.assert_same(res, ref)
+        from scipy.optimize import _minimize_batched as mb
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            assert mb._n_workers(ex.map) == 3
+
     def test_small_batch_is_not_distributed(self):
         def failing_map(func, iterable):
             raise AssertionError("must not be called")
